@@ -1,12 +1,14 @@
 import re
-import json
 from dataclasses import dataclass
 from datetime import datetime
 from dateutil import tz
+
 import pandas as pd
 import streamlit as st
 
-# ========= CONFIG =========
+# =========================
+# Config
+# =========================
 DEFAULT_TZ = tz.gettz("America/Montevideo")
 
 ZONE_DICT = {
@@ -29,7 +31,6 @@ ZONE_DICT = {
     "ocean park": "Ocean Park",
     "sauce de portezuelo": "Sauce de Portezuelo",
     "piriapolis": "Piriápolis",
-    "rincón del indio": "Rincón del Indio",
 }
 
 PROPERTY_TYPE_HINTS = [
@@ -49,8 +50,10 @@ PROPERTY_TYPE_HINTS = [
 ]
 
 BUY_HINTS = ["en venta", "para compra", "compra", "vendo", "ofrezco", "tenemos", "en exclusividad"]
-RENT_HINTS = ["alquiler", "alquilo", "anual", "invernal", "temporal", "2da quincena", "quincena", "mensuales", "mes"]
+RENT_HINTS = ["alquiler", "alquilo", "anual", "invernal", "temporal", "quincena", "mensuales", "mes"]
 
+# Formato típico export WhatsApp Android:
+# 06/02/2026, 08:31 - Nombre: mensaje
 HEADER_RE = re.compile(
     r"^(\d{1,2})/(\d{1,2})/(\d{4}),\s+(\d{1,2}):(\d{2}).*?-\s*(.*?):\s*(.*)$",
     re.IGNORECASE
@@ -68,7 +71,7 @@ RANGE_RE = re.compile(r"(\d[\d.\s]{1,10})\s*[-/]\s*(\d[\d.\s]{1,10})", re.IGNORE
 DORM_RE = re.compile(r"(\d)\s*(?:dorm(?:itorios)?|dor\b|dormi\.?)", re.IGNORECASE)
 M2_RE = re.compile(r"(\d{3,5})\s*m2", re.IGNORECASE)
 
-SYSTEM_HINTS = ["cifrados de extremo a extremo", "creó el grupo", "se te añadió al grupo", "obten más información"]
+SYSTEM_HINTS = ["cifrados de extremo a extremo", "creó el grupo", "se te añadió al grupo", "obten"]
 
 KEYWORD_BUILDINGS = [
     "torres del este", "gala", "gala puerto", "gala vista", "gala tower",
@@ -77,6 +80,10 @@ KEYWORD_BUILDINGS = [
     "miami boulevard", "casino miguez", "marigot", "signature", "citrea",
 ]
 
+
+# =========================
+# Helpers
+# =========================
 @dataclass
 class Message:
     ts: datetime
@@ -91,11 +98,8 @@ def normalize_phone(s: str):
     return f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}"
 
 
-def parse_ts(d, m, y, hh, mm):
-    # WhatsApp export: no confiamos en a.m./p.m. porque a veces viene con caracteres raros.
-    # Tomamos hora tal cual. Si te queda corrido, luego afinamos con heurística.
-    dt = datetime(int(y), int(m), int(d), int(hh), int(mm), tzinfo=DEFAULT_TZ)
-    return dt
+def parse_ts(d, mo, y, hh, mm):
+    return datetime(int(y), int(mo), int(d), int(hh), int(mm), tzinfo=DEFAULT_TZ)
 
 
 def has_media(text: str):
@@ -140,22 +144,16 @@ def detect_property_type(text: str):
 def normalize_zone_list(text: str):
     t = (text or "").lower()
     zones = set()
-
-    # "Zonas: A, B, C"
     z = re.search(r"zonas?\s*:\s*(.+)", t, re.IGNORECASE)
     if z:
         raw = z.group(1)
         for part in re.split(r"[,\n;•]+", raw):
             p = part.strip(" .*-_").lower()
-            if not p:
-                continue
-            zones.add(ZONE_DICT.get(p, p.title()))
-
-    # fallback: scan dict keys
+            if p:
+                zones.add(ZONE_DICT.get(p, p.title()))
     for k, v in ZONE_DICT.items():
         if k in t:
             zones.add(v)
-
     return sorted(zones)
 
 
@@ -177,27 +175,23 @@ def _clean_num(s: str) -> int:
 
 
 def extract_money(text: str):
-    """
-    Devuelve dict: {currency, min, max, confidence}
-    """
     t = (text or "").lower()
     currency = None
     if USD_RE.search(t):
         currency = "USD"
-    elif "usd" in t:
-        currency = "USD"
     elif UYU_RE.search(t):
         currency = "UYU"
 
-    # rangos: "300 - 500 mil"
     rm = RANGE_RE.search(t)
     if rm:
         a = _clean_num(rm.group(1))
         b = _clean_num(rm.group(2))
-        tail = t[rm.start(): rm.end()+25]
+        tail = t[rm.start(): rm.end() + 25]
         if "mil" in tail or "k" in tail:
-            if a < 1000: a *= 1000
-            if b < 1000: b *= 1000
+            if a < 1000:
+                a *= 1000
+            if b < 1000:
+                b *= 1000
         return {"currency": currency or "USD", "min": min(a, b), "max": max(a, b), "confidence": 0.8}
 
     candidates = []
@@ -215,21 +209,12 @@ def extract_money(text: str):
         return None
 
     op = detect_operation(t)
-
-    # Heurística: compra -> mayor número, alquiler -> menor número
     n = max(candidates) if op == "buy" else min(candidates)
-
     conf = 0.7 if currency else 0.4
 
-    # caso típico: "hasta 35mil" alquiler anual (UYU) sin USD explícito
     if "35mil" in t and not USD_RE.search(t):
         return {"currency": "UYU", "min": None, "max": 35000, "confidence": 0.35}
 
-    # si es alquiler y n está tipo 800/1200 y aparece "mensuales" => USD prob
-    if op == "rent" and n <= 10000 and ("usd" in t or "u$s" in t or "dolares" in t or "dólares" in t):
-        return {"currency": "USD", "min": None, "max": n, "confidence": max(conf, 0.7)}
-
-    # default
     return {"currency": currency or ("USD" if n >= 5000 else "UYU"), "min": None, "max": n, "confidence": conf}
 
 
@@ -240,11 +225,7 @@ def extract_m2(text: str):
 
 def extract_keywords(text: str):
     t = (text or "").lower()
-    kw = []
-    for pat in KEYWORD_BUILDINGS:
-        if pat in t:
-            kw.append(pat)
-    return kw
+    return [k for k in KEYWORD_BUILDINGS if k in t]
 
 
 def parse_whatsapp_export(txt: str):
@@ -258,8 +239,7 @@ def parse_whatsapp_export(txt: str):
             if current:
                 messages.append(current)
             d, mo, y, hh, mm, sender, text = m.groups()
-            ts = parse_ts(d, mo, y, hh, mm)
-            current = Message(ts=ts, sender_raw=sender, text=text)
+            current = Message(ts=parse_ts(d, mo, y, hh, mm), sender_raw=sender, text=text)
         else:
             if current:
                 current.text += "\n" + line
@@ -281,7 +261,6 @@ def parse_whatsapp_export(txt: str):
             "urls": urls,
             "text": (msg.text or "").strip(),
         })
-
     return pd.DataFrame(rows)
 
 
@@ -294,7 +273,6 @@ def build_leads(df_msgs: pd.DataFrame):
             continue
 
         name = r["sender_raw"] if (r["sender_raw"] and not str(r["sender_raw"]).startswith("+")) else ""
-        # firma: última línea no vacía (si parece nombre)
         tail = [x.strip() for x in str(text).splitlines() if x.strip()]
         if not name and tail:
             cand = tail[-1]
@@ -310,6 +288,15 @@ def build_leads(df_msgs: pd.DataFrame):
         min_m2 = extract_m2(text)
         pets_req = 1 if ("mascota" in text.lower() or "perro" in text.lower()) else 0
 
+        t = text.lower()
+        urgency = 0
+        if "urgente" in t or "para ver mañana" in t or "para ver hoy" in t or "cerrar ya" in t:
+            urgency += 2
+        if "cliente concreto" in t or "cliente activo" in t:
+            urgency += 2
+        if "para ver" in t:
+            urgency += 1
+
         leads.append({
             "ts": r["ts"],
             "phone": phone,
@@ -319,21 +306,20 @@ def build_leads(df_msgs: pd.DataFrame):
             "bedrooms_min": bmin,
             "bedrooms_max": bmax,
             "budget_currency": (money or {}).get("currency"),
-            "budget_min": (money or {}).get("min"),
             "budget_max": (money or {}).get("max"),
             "zones": zones,
             "keywords": kw,
             "min_m2": min_m2,
             "pets_required": pets_req,
-            "confidence": (money or {}).get("confidence", 0.35 if money else 0.25),
-            "raw_text": text[:800],
+            "confidence": (money or {}).get("confidence", 0.25),
+            "urgency": urgency,
+            "raw_text": text[:900],
         })
 
     if not leads:
-        return pd.DataFrame(columns=[])
+        return pd.DataFrame()
 
     df = pd.DataFrame(leads)
-    # última búsqueda por teléfono
     df = df.sort_values("ts", ascending=False).drop_duplicates(subset=["phone"], keep="first")
     return df
 
@@ -351,6 +337,7 @@ def build_listings(df_msgs: pd.DataFrame):
         money = extract_money(text)
         zones = normalize_zone_list(text)
         zone_guess = zones[0] if zones else None
+        kw = extract_keywords(text)
 
         listings.append({
             "ts": r["ts"],
@@ -363,150 +350,347 @@ def build_listings(df_msgs: pd.DataFrame):
             "price_currency": (money or {}).get("currency"),
             "price": (money or {}).get("max"),
             "urls": r["urls"],
-            "confidence": (money or {}).get("confidence", 0.35 if money else 0.25),
-            "raw_text": text[:800],
+            "keywords": kw,
+            "confidence": (money or {}).get("confidence", 0.25),
+            "raw_text": text[:900],
         })
 
     if not listings:
-        return pd.DataFrame(columns=[])
+        return pd.DataFrame()
 
-    df = pd.DataFrame(listings).sort_values("ts", ascending=False)
-    return df
+    return pd.DataFrame(listings).sort_values("ts", ascending=False)
 
 
-# ========= UI =========
-st.set_page_config(page_title="BrokerOS – WhatsApp Deal Flow", layout="wide")
+def apply_search(df: pd.DataFrame, cols: list[str], query: str):
+    if df is None or len(df) == 0 or not query.strip():
+        return df
+    qq = query.strip().lower()
+    mask = False
+    for c in cols:
+        if c in df.columns:
+            mask = mask | df[c].astype(str).str.lower().str.contains(qq, na=False)
+    return df[mask].copy()
 
-st.title("BrokerOS – WhatsApp Deal Flow (MVP)")
-st.caption("Ingesta → extracción → leads/listings + detalle + plantillas WhatsApp. (Iteración rápida desde el celular)")
 
-# Fuente TXT
+def wa_link(phone: str | None):
+    if not phone:
+        return None
+    return f"https://wa.me/{phone.replace('+','')}"
+
+
+def chips_md(items):
+    if not items:
+        return ""
+    safe = []
+    for x in items:
+        safe.append(str(x).replace("<", "&lt;").replace(">", "&gt;"))
+    return "".join([f'<span class="chip">{x}</span>' for x in safe])
+
+
+def card_box(title, subtitle, body_html, actions_html="", chips_html=""):
+    # basic sanitize for title/subtitle
+    title = str(title).replace("<", "&lt;").replace(">", "&gt;")
+    subtitle = str(subtitle).replace("<", "&lt;").replace(">", "&gt;")
+    st.markdown(f"""
+<div class="bx">
+  <div class="bx-title">{title}</div>
+  <div class="bx-sub">{subtitle}</div>
+  <div class="bx-body">{body_html}</div>
+  <div>{chips_html}</div>
+  <div class="actionrow">{actions_html}</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="BrokerOS – WhatsApp", layout="wide")
+
+st.markdown("""
+<style>
+.block-container { padding-top: 1rem; padding-bottom: 2.5rem; }
+h1 { font-size: 1.55rem !important; }
+h2 { font-size: 1.15rem !important; }
+h3 { font-size: 1.0rem !important; }
+small, .stCaption { color: #9CA3AF; }
+
+.bx {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 18px;
+  padding: 14px;
+  margin: 10px 0;
+  background: rgba(255,255,255,0.03);
+}
+.bx-title { font-weight: 800; font-size: 1.0rem; }
+.bx-sub { color: #9CA3AF; font-size: 0.85rem; margin-top: 3px; }
+.bx-body { margin-top: 10px; font-size: 0.95rem; line-height: 1.35; }
+
+.chip { display:inline-block; padding:4px 10px; border-radius:999px;
+  border:1px solid rgba(255,255,255,0.10); margin-right:6px; margin-top:6px;
+  font-size:0.80rem; color:#E5E7EB; background: rgba(255,255,255,0.02);
+}
+
+.actionrow { margin-top: 10px; font-size: 0.95rem; }
+hr { border-color: rgba(255,255,255,0.08); }
+</style>
+""", unsafe_allow_html=True)
+
+# Sidebar + session state
+if "txt" not in st.session_state:
+    st.session_state.txt = ""
+
 with st.sidebar:
-    st.header("Fuente")
-    mode = st.radio("¿De dónde cargar?", ["Archivo en repo", "Pegar texto"], index=0)
+    st.header("BrokerOS")
+    st.caption("Ingesta → extracción → acción rápida")
 
-    txt = ""
+    mode = st.radio("Fuente de datos", ["Archivo en repo", "Subir archivo", "Pegar texto"], index=0)
+
+    txt_in = ""
     if mode == "Archivo en repo":
         filename = st.text_input("Nombre del .txt", value="inmo_registradas.txt")
         try:
-            with open(filename, "r", encoding="utf-8") as f:
-                txt = f.read()
-            st.success(f"OK: {filename} cargado")
+            with open(filename, "r", encoding="utf-8", errors="replace") as f:
+                txt_in = f.read()
+            st.success(f"OK: {filename}")
         except Exception as e:
-            st.error(f"No pude abrir {filename}. Subilo al repo o corregí el nombre.")
+            st.error("No pude abrir el archivo.")
+            st.caption(str(e))
+
+    elif mode == "Subir archivo":
+        up = st.file_uploader("Export de WhatsApp (.txt)", type=["txt"])
+        if up:
+            txt_in = up.read().decode("utf-8", errors="replace")
+            st.success(f"OK: {up.name}")
+
     else:
-        txt = st.text_area("Pegá el export acá", height=240)
+        txt_in = st.text_area("Pegá el export", height=180, placeholder="Pegá el texto exportado…")
 
     st.divider()
-    st.header("Filtros rápidos")
-    min_conf = st.slider("Confianza mínima", 0.0, 1.0, 0.35, 0.05)
+    st.subheader("Filtros")
+    q = st.text_input("Buscar (tel / nombre / zona)", value="")
+    min_conf = st.slider("Confianza mínima", 0.0, 1.0, 0.30, 0.05)
     show_system = st.checkbox("Mostrar SYSTEM", value=False)
+    show_other = st.checkbox("Mostrar OTHER", value=False)
+
+    st.divider()
+    process = st.button("Procesar", type="primary", use_container_width=True)
+    clear = st.button("Limpiar", use_container_width=True)
+
+if clear:
+    st.session_state.txt = ""
+    st.rerun()
+
+if process and txt_in.strip():
+    st.session_state.txt = txt_in
+
+txt = st.session_state.txt
+
+st.title("BrokerOS – WhatsApp Deal Flow (MVP)")
+st.caption("Ingesta → extracción → leads/listings + detalle + plantillas WhatsApp (iteración rápida desde el celular)")
 
 if not txt.strip():
-    st.info("Subí el .txt al repo (ej: inmo_registradas.txt) o pegá texto en la barra lateral.")
+    st.info("📌 Elegí una fuente en la barra lateral y tocá **Procesar**.")
     st.stop()
 
+if not HEADER_RE.search(txt):
+    st.error("No reconozco el formato del export. Probá exportar el chat como texto (sin multimedia).")
+    with st.expander("Ver 25 primeras líneas (debug)"):
+        st.code("\n".join(txt.splitlines()[:25]), language="text")
+    st.stop()
+
+# Parse + build
 df_msgs = parse_whatsapp_export(txt)
+
 if not show_system:
     df_msgs = df_msgs[df_msgs["msg_type"] != "SYSTEM"].copy()
+if not show_other:
+    df_msgs = df_msgs[df_msgs["msg_type"] != "OTHER"].copy()
 
 df_leads = build_leads(df_msgs)
 df_listings = build_listings(df_msgs)
 
-# KPIs
-c1, c2, c3, c4, c5 = st.columns(5)
+# KPIs + downloads
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Mensajes", len(df_msgs))
 c2.metric("Leads", int((df_msgs["msg_type"] == "LEAD_REQUEST").sum()))
 c3.metric("Listings", int((df_msgs["msg_type"] == "LISTING").sum()))
 c4.metric("Media", int((df_msgs["msg_type"] == "MEDIA").sum()))
-c5.metric("Último msg", df_msgs["ts"].max().strftime("%Y-%m-%d %H:%M") if len(df_msgs) else "—")
 
-st.divider()
+if len(df_msgs) > 0:
+    st.caption(
+        f"Rango: {df_msgs['ts'].min().strftime('%d/%m %H:%M')} → {df_msgs['ts'].max().strftime('%d/%m %H:%M')}"
+    )
 
-tab1, tab2, tab3 = st.tabs(["Leads", "Listings", "Ingesta (raw)"])
+colA, colB = st.columns(2)
+with colA:
+    st.download_button(
+        "⬇️ leads.csv",
+        data=(df_leads.to_csv(index=False).encode("utf-8") if len(df_leads) else "phone\n".encode("utf-8")),
+        file_name="leads.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+with colB:
+    st.download_button(
+        "⬇️ listings.csv",
+        data=(df_listings.to_csv(index=False).encode("utf-8") if len(df_listings) else "lister_phone\n".encode("utf-8")),
+        file_name="listings.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
-with tab1:
-    st.subheader("Leads detectados (último criterio por teléfono)")
+tabs = st.tabs(["Hoy", "Leads", "Listings", "Raw"])
+
+# =========================
+# Tab: Hoy
+# =========================
+with tabs[0]:
+    st.subheader("Prioridad HOY (táctico)")
     if len(df_leads) == 0:
-        st.warning("No se detectaron leads todavía.")
+        st.info("No hay leads detectados.")
     else:
-        view = df_leads.copy()
-        view["zones"] = view["zones"].apply(lambda z: ", ".join(z) if isinstance(z, list) else "")
-        view["keywords"] = view["keywords"].apply(lambda z: ", ".join(z) if isinstance(z, list) else "")
-        view = view[view["confidence"] >= min_conf].copy()
+        view = df_leads[df_leads["confidence"] >= min_conf].copy()
+        view = apply_search(view, ["phone", "name", "raw_text"], q)
+        view = view.sort_values(["urgency", "ts"], ascending=[False, False]).head(30)
 
-        st.dataframe(
-            view[["ts","phone","name","operation","property_type","bedrooms_min","bedrooms_max","budget_currency","budget_max","zones","keywords","pets_required","confidence"]],
-            use_container_width=True,
-            hide_index=True
-        )
+        for _, r in view.iterrows():
+            zones = ", ".join(r["zones"]) if isinstance(r["zones"], list) else ""
+            kw = ", ".join(r["keywords"]) if isinstance(r["keywords"], list) else ""
+            dorm = r["bedrooms_min"] if pd.notna(r["bedrooms_min"]) else "—"
+            money = f"{r.get('budget_currency') or ''} {r.get('budget_max') or ''}".strip()
+
+            tags = []
+            if r.get("pets_required") == 1:
+                tags.append("Mascota")
+            if r.get("urgency", 0) >= 2:
+                tags.append("Urgente")
+            if kw:
+                tags.append("Edificio")
+
+            link = wa_link(r["phone"])
+            actions = ""
+            if link:
+                actions += f'💬 <a href="{link}" target="_blank">Abrir WhatsApp</a> &nbsp; | &nbsp; '
+            actions += "📋 Plantilla abajo (tab Leads)"
+
+            body = (
+                f"<b>Tipo:</b> {r.get('property_type','—')}<br>"
+                f"<b>Dorm:</b> {dorm}<br>"
+                f"<b>Zonas:</b> {zones or '—'}<br>"
+                f"<b>Keywords:</b> {kw or '—'}"
+            )
+
+            card_box(
+                title=f"LEAD • {money or '—'}",
+                subtitle=f"{r['phone']} · {r.get('name','') or ''}",
+                body_html=body,
+                chips_html=chips_md(tags),
+                actions_html=actions,
+            )
+
+# =========================
+# Tab: Leads
+# =========================
+with tabs[1]:
+    st.subheader("Leads")
+    if len(df_leads) == 0:
+        st.info("No hay leads.")
+    else:
+        view = df_leads[df_leads["confidence"] >= min_conf].copy()
+        view = apply_search(view, ["phone", "name", "raw_text"], q)
+        view = view.sort_values("ts", ascending=False)
 
         st.markdown("### Detalle + Plantilla WhatsApp")
-        phones = view["phone"].tolist()
-        sel = st.selectbox("Elegí un lead por teléfono", phones)
-        row = df_leads[df_leads["phone"] == sel].iloc[0].to_dict()
+        sel = st.selectbox("Elegí un lead", view["phone"].tolist())
+        row = view[view["phone"] == sel].iloc[0].to_dict()
 
-        zones_txt = ", ".join(row["zones"]) if isinstance(row["zones"], list) else ""
-        dorm_txt = str(row["bedrooms_min"]) + (f"–{row['bedrooms_max']}" if row.get("bedrooms_max") else "")
-        budget_txt = f"{row.get('budget_currency','')} {row.get('budget_max','')}"
-        ptype = row.get("property_type","propiedad")
+        zones = ", ".join(row["zones"]) if isinstance(row["zones"], list) else ""
+        dorm = row["bedrooms_min"] if pd.notna(row["bedrooms_min"]) else "—"
+        money = f"{row.get('budget_currency') or ''} {row.get('budget_max') or ''}".strip()
 
-        colA, colB = st.columns([1.2, 1])
-        with colA:
-            st.write("**Mensaje (recortado)**")
-            st.code(row.get("raw_text",""), language="text")
+        st.code(row.get("raw_text", ""), language="text")
 
-        with colB:
-            st.write("**Acciones**")
-            st.write(f"📞 **Tel:** {row['phone']}")
-            wa_link = f"https://wa.me/{row['phone'].replace('+','')}"
-            st.markdown(f"💬 WhatsApp: {wa_link}")
-            st.write("---")
-            template = (
-                f"Hola {row.get('name','') or ''}! Vi tu búsqueda de {ptype} "
-                f"({dorm_txt} dorm) en {zones_txt}. "
-                f"¿Sigue vigente? Tengo opciones dentro de {budget_txt}. "
-                f"¿Querés que te mande 2-3 alternativas por acá?"
-            ).strip()
-            st.text_area("Plantilla WhatsApp", value=template, height=140)
+        plantilla = (
+            f"Hola {row.get('name','') or ''}! Vi tu búsqueda de {row.get('property_type','propiedad')} "
+            f"({dorm} dorm) en {zones}. ¿Sigue vigente? Tengo opciones dentro de {money}. "
+            "¿Querés que te mande 2-3 alternativas por acá?"
+        ).strip()
 
-with tab2:
-    st.subheader("Listings detectados")
+        st.text_area("Plantilla", value=plantilla, height=140)
+
+        st.markdown("---")
+
+        for _, r in view.head(50).iterrows():
+            zones = ", ".join(r["zones"]) if isinstance(r["zones"], list) else ""
+            dorm = r["bedrooms_min"] if pd.notna(r["bedrooms_min"]) else "—"
+            money = f"{r.get('budget_currency') or ''} {r.get('budget_max') or ''}".strip()
+
+            link = wa_link(r["phone"])
+            body = (
+                f"<b>Tipo:</b> {r.get('property_type','—')}<br>"
+                f"<b>Dorm:</b> {dorm}<br>"
+                f"<b>Zonas:</b> {zones or '—'}<br>"
+                f"<b>Conf:</b> {r.get('confidence',0):.2f}"
+            )
+
+            card_box(
+                title=f"{money or '—'} • {r.get('property_type','—')}",
+                subtitle=f"{r['phone']} · {r.get('name','') or ''}",
+                body_html=body,
+                actions_html=(f'💬 <a href="{link}" target="_blank">WhatsApp</a>' if link else ""),
+            )
+
+# =========================
+# Tab: Listings
+# =========================
+with tabs[2]:
+    st.subheader("Listings")
     if len(df_listings) == 0:
-        st.warning("No se detectaron listings todavía.")
+        st.info("No hay listings.")
     else:
-        view = df_listings.copy()
-        view["urls_count"] = view["urls"].apply(lambda u: len(u) if isinstance(u, list) else 0)
-        view = view[view["confidence"] >= min_conf].copy()
+        view = df_listings[df_listings["confidence"] >= min_conf].copy()
+        view = apply_search(view, ["lister_phone", "lister_name", "raw_text"], q)
+        view = view.sort_values("ts", ascending=False)
 
-        st.dataframe(
-            view[["ts","lister_phone","lister_name","operation","property_type","zone_guess","bedrooms","price_currency","price","urls_count","confidence"]],
-            use_container_width=True,
-            hide_index=True
-        )
+        for _, r in view.iterrows():
+            price = f"{r.get('price_currency') or ''} {r.get('price') or ''}".strip()
+            zone = r.get("zone_guess") or "Zona ?"
+            dorm = r.get("bedrooms") if pd.notna(r.get("bedrooms")) else "—"
+            urls = r.get("urls") or []
+            kw = ", ".join(r.get("keywords") or [])
 
-        st.markdown("### Detalle")
-        idx = st.selectbox("Elegí un listing (por timestamp)", view["ts"].astype(str).tolist())
-        row = view[view["ts"].astype(str) == idx].iloc[0].to_dict()
+            actions = ""
+            if urls:
+                actions = "<br>".join([f'🔗 <a href="{u}" target="_blank">Abrir link</a>' for u in urls[:3]])
 
-        colA, colB = st.columns([1.2, 1])
-        with colA:
-            st.write("**Mensaje (recortado)**")
-            st.code(row.get("raw_text",""), language="text")
+            body = (
+                f"<b>Zona:</b> {zone}<br>"
+                f"<b>Dorm:</b> {dorm}<br>"
+                f"<b>Keywords:</b> {kw or '—'}<br>"
+                f"<b>Conf:</b> {r.get('confidence',0):.2f}"
+            )
 
-        with colB:
-            st.write("**Links**")
-            for u in (row.get("urls") or []):
-                st.markdown(f"- {u}")
-            st.write("---")
-            st.write("**Siguiente paso:** acá vamos a conectar el botón *Buscar leads compatibles* (matching).")
+            card_box(
+                title=f"{price or '—'} • {r.get('property_type','—')}",
+                subtitle=f"Links: {len(urls)} · {r.get('lister_name','') or ''}",
+                body_html=body,
+                actions_html=actions,
+            )
 
-with tab3:
-    st.subheader("Ingesta raw (para auditar parsing)")
-    df_show = df_msgs.copy()
-    df_show["ts"] = df_show["ts"].dt.strftime("%Y-%m-%d %H:%M")
+# =========================
+# Tab: Raw
+# =========================
+with tabs[3]:
+    st.subheader("Ingesta (raw)")
+    show = df_msgs.copy()
+    if len(show):
+        show["ts"] = show["ts"].dt.strftime("%d/%m %H:%M")
     st.dataframe(
-        df_show[["ts","msg_type","sender_raw","sender_phone","has_media","text"]],
+        show[["ts", "msg_type", "sender_raw", "sender_phone", "has_media", "text"]],
         use_container_width=True,
         hide_index=True
-                 )
+    )
+
+    with st.expander("Ver 25 primeras líneas del texto (debug)"):
+        st.code("\n".join(txt.splitlines()[:25]), language="text")
